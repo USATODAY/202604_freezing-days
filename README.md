@@ -31,3 +31,7 @@ The raw climate data is extracted through the script itself. The first time runn
 If you use this data, please cite it and [link to the published project](https://www.usatoday.com/graphics/interactives/how-climate-change-is-impacting-winters/). Citation suggestion below:
  
 “1956-2025 Freezing Days Analysis.” *USA Today*, https://www.usatoday.com/graphics/interactives/how-climate-change-is-impacting-winters/. Accessed [date accessed]."
+
+## Credits
+
+Code written by Ignacio Calderon, USA Today Data Reporter. For any questions, reach out at [icalderon@usatoday.com](icalderon@usatoday.com)
