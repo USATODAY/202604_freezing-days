@@ -34,4 +34,4 @@ If you use this data, please cite it and [link to the published project](https:/
 
 ## Credits
 
-Code written by Ignacio Calderon, USA Today Data Reporter. For any questions, reach out at [icalderon@usatoday.com](icalderon@usatoday.com)
+Code written by Ignacio Calderon, USA Today Data Journalist. For any questions, reach out at [icalderon@usatoday.com](icalderon@usatoday.com)
