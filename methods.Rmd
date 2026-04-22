@@ -1,0 +1,997 @@
+---
+title: "Freezing days analysis"
+author: "Ignacio Calderon, USA TODAY"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: united
+    highlight: zenburn
+---
+
+```{r setup, include=FALSE}
+
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(terra)
+library(curl)
+library(lubridate)
+library(weathermetrics)
+library(DT)
+library(tmap)
+library(svglite)
+library(rmapshaper)
+
+rm(list = ls())
+
+knitr::opts_chunk$set(warning = F, message = F)
+
+## check if inputs have already been downloaded
+
+# raw climate data:
+flag_dir  <- "inputs"
+flag_file <- file.path(flag_dir, "input_status.txt")
+noaa_exists <- file.exists(flag_file)
+needs_noaa <- !noaa_exists
+# processed city data:
+city_data_path <- "outputs/city_data.RDS"
+city_exists <- file.exists(city_data_path)
+needs_city <- !city_exists
+# processed county data:
+county_data_path <- "outputs/county_data.RDS"
+county_exists <- file.exists(county_data_path)
+needs_county <- !county_exists
+
+```
+
+## Results
+
+We analyzed temperature data for the past seven decades to see how winters in major cities have changed. 
+
+We found almost all cities analyzed (255/257) are now experiencing fewer freezing days per season compared to the mid 1950s -- with 86% of cities losing at least a week of freezing days. In addition, these warming cities:
+
+- On average are now experiencing 19 fewer freezing days per water year.
+- Freezing days on average are starting 11 days later and ending 26 days earlier for a shorter cold season. 
+- The longest streak of freezing days in a water year is also 12 days shorter on average.
+- The coldest day of the water year has also warmed an average of 5.7 degrees Fahrenheit.
+
+In short, the freezing season is becoming shorter and milder.
+
+This is based on an analysis of climate data spanning 1956-2025. We extracted daily minimum temperature from the center of every city with a population over 100,000. We then ran linear regressions on those that had at least one freezing day in at least half the years.
+
+For more details on our methods, read below.
+
+## Methods
+
+### Data processing
+
+For this analysis, we used daily temperature data from [NOAA's nClimGrid-Daily](https://www.ncei.noaa.gov/products/land-based-station/nclimgrid-daily). This is gridded product has a resolution is about 5-km and goes back to 1951. 
+
+The data can be accessed in many formats but we compiled netCDF monthly files from 1956-2025 for a complete 70 years. These 800+ files have a total size of ~50 GB. We started by automating the extraction like this:
+
+```{r c1, eval = needs_noaa}
+# first let's make the URLs to extract the raw data for 1955:2025
+# adding a year before to complete winter season for first year
+
+years <- 1955:2025
+months <- sprintf("%02d", 1:12)
+base <- "https://www.ncei.noaa.gov/data/nclimgrid-daily/access/grids/"
+
+# create url combinations
+links <- expand.grid(year = years, month = months) %>%
+  mutate(url = paste0(base, year, "/ncdd-", year, month, "-grd-scaled.nc")) %>%
+  arrange(year)
+
+# now create a function that will download the files and store them in lists
+download_fc <- function(var){
+  
+  # define the target directory and create it if it doesn't exist
+  dir.create("inputs/noaa", showWarnings = F)
+  
+  # define the file path for the downloaded file
+  file_path <- file.path("inputs/noaa", basename(var))
+  
+  # download the file
+  curl_download(var, file_path)
+  
+  # read the netCDF file
+  data <- rast(paste0("inputs/noaa/", basename(var)))
+  
+  return(data)
+  
+}
+
+# iterate this for both variables
+data_list <- lapply(links$url, download_fc)
+
+rm(links, base, months, years)
+
+# ---- status write
+# create a txt file with metadata on the data download
+# that way next time we run the script and input data is present, we can skip this chunk
+
+# define where the data and flag live
+data_root <- "inputs/noaa"
+
+# get a quick summary
+all_files   <- list.files(data_root, recursive = TRUE, full.names = TRUE)
+total_bytes <- sum(file.info(all_files)$size, na.rm = TRUE)
+
+# write to a temp file and then atomically rename to avoid partial/corrupt flags
+tmp_flag <- tempfile(pattern = "input_status_", tmpdir = flag_dir)
+
+status_lines <- c(
+  sprintf("downloaded = TRUE"),
+  sprintf("timestamp = %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S %Z")),
+  sprintf("data_root = %s", data_root),
+  sprintf("file_count = %d", length(all_files)),
+  sprintf("total_bytes = %s", format(total_bytes, big.mark = ",")))
+
+writeLines(status_lines, con = tmp_flag)
+file.rename(tmp_flag, flag_file)
+
+rm(all_files, total_bytes, tmp_flag, status_lines, data_root, flag_dir, flag_file)
+
+```
+
+```{r c1B, eval = noaa_exists}
+## if the input files are already downloaded, import them here instead:
+
+# list the files
+data_files <- list.files("inputs/noaa", full.names = TRUE)
+
+# load the files as SpatRaster objects
+data_list <- lapply(data_files, rast)
+
+rm(data_files)
+
+# check units, projections, number of layers for a sample monthly file
+# data_list[[1]] # Celsius
+# st_crs(data_list[[1]]) # WGS 84
+# nlyr(data_list[[1]]) # 124 layers. 1/variable/day (tmin, tmix, prcp, tavg)
+```
+
+This data has daily min, max and average temperature in degrees Celsius. Before we can use it, we need to chose the areas of interest. Since the data comes in a grid, the analysis can be done at different geographic levels. We will start with cities.
+
+We used the `tidycensus` package to query all cities and their corresponding boundaries. We then filtered for major cities. We defined this as population greater than or equal to 100,000 and ended up with 310 cities.
+
+```{r c2, eval = needs_city}
+# first let's get a list of census "places"
+# this includes cities, towns, villages
+options(tigris_use_cache = TRUE)
+us_places <- get_acs(geography = "place",
+                     variables = "B01003_001", # total population
+                     year = 2022,
+                     survey = "acs5",
+                     output = "wide",
+                     geometry = TRUE) %>%
+                     select(NAME, GEOID, pop = B01003_001E, geometry)
+
+# can filter for cities with pop > 100k
+us_cities_big <- us_places %>%
+  filter(str_detect(NAME, "city")) %>%
+  filter(pop >= 100000)
+
+rm(us_places)
+
+# clean up some names
+us_cities_big <- us_cities_big %>%
+  mutate(NAME = str_replace(NAME, "San Buenaventura \\(Ventura\\)", "Ventura"),
+         NAME = str_replace(NAME, " \\(.*\\)", ""),
+         NAME = str_replace(NAME, " city,", ","))
+```
+
+With a list of cities, we also calculated the centroids for each. This lets us convert the gridded climate data into point data. To do this, we made a unique key from the city coordinates. With that key, we can tell R where to grab a city's temperature from each day layer in the map.
+
+The result is a database with a daily timeseries for each city. The final step before we finish prepping the raw data is converting the temperature units to Fahrenheit.
+
+```{r c3, eval = needs_city}
+# check projection
+# st_crs(us_cities_big) # NAD83
+
+# get the centroids 
+us_cities_big <- us_cities_big %>%
+  mutate(center = st_centroid(geometry)) %>%
+  st_drop_geometry() %>% # removes city outline but keeps centroids
+  st_as_sf() %>%
+  st_transform(crs = st_crs(data_list[[1]])) # reproject to match our climate data
+
+# we'll do this by getting a sample layer from temp data
+# and making a key from the x and y coords
+sample_layer <- data_list[[1]][[1]] %>% # first monthly file, first day
+  as.data.frame(xy = TRUE) %>%
+  mutate(key = paste0(round(x, 5), "_", round(y, 5))) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(data_list[[1]])) %>%
+  select(-contains("tmax_"))
+
+# if we join this to our city list,
+# we'll have a key that connects each city to its nearest pixel in the climate data
+key_df <- us_cities_big %>%
+  st_join(sample_layer, join = st_nearest_feature) %>%
+  select(NAME, GEOID, key) %>%
+  st_drop_geometry()
+
+# check how many keys were created
+# length(unique(key_df$key)) # 310 keys for 310 cities
+
+rm(sample_layer)
+
+## now we can extract the data from the gridded file
+
+# convert city centers to a terra SpatVector object
+city_points <- vect(us_cities_big)
+
+# let's make a function to extract temperature values
+# for each city center over all time layers
+extract_fc <- function(gridded_data, place_points, key_df){
+  
+  # extract variables from grid
+  data <- terra::extract(gridded_data, place_points, xy = TRUE, ID = FALSE)
+  
+  # the extraction leaves one column for each day/variable plus columns for x and y coords
+  # we can add city names/GEOID back using our crosswalk
+  data <- data %>%
+    # make key from x and y the same way we did before
+    mutate(key = paste0(round(x, 5), "_", round(y, 5))) %>%
+    # now join
+    left_join(key_df, by = "key")
+  
+  # here, we can remove precipitation data since we don't need it
+  # also drop tmax_ and tavg_ for now since processing can get heavy
+  data <- data %>%
+    select(-contains("prcp_"), -starts_with("tmax_"), -starts_with("tavg_"))
+  
+  # pivot longer
+  data_long <- data %>%
+    pivot_longer(cols = c(starts_with("tmin_")), # can add tmax_ and tavg_ here
+                 names_to = c("measure", "day"),
+                 names_pattern = "(tmin)_(\\d+)", # (tmax|tmin|tavg)
+                 values_to = "celsius") %>%
+    mutate(day = as.integer(day))
+  
+  # now we need to add data
+  # create a lookup table for day -> date
+  dates <- terra::time(gridded_data)
+  
+  date_lookup <- tibble(date = dates) %>%
+    mutate(day = as.integer(sub(".*-", "", date))) %>%
+    distinct()
+  
+  # join that
+  data_long <- left_join(data_long, date_lookup, by = "day") %>% 
+    select(place = NAME, key, GEOID, measure, celsius, date)
+  
+  return(data_long)
+  
+}
+
+# iterate
+city_data <- map_dfr(.x = data_list,
+                     .f = extract_fc,
+                     place_points = city_points,
+                     key_df = key_df)
+
+rm(city_points, us_cities_big)
+
+# save this as an R object to save processing time
+saveRDS(city_data, city_data_path)
+```
+
+```{r c4}
+
+# if this is a quick run, read the input file
+# if it's a full run, the data was created in the last chunk, so carry on
+if (needs_city == F) {
+  city_data <- readRDS(city_data_path)
+} else {
+  message("Using input files from previous computation")
+}
+
+# convert celsius to F
+# then let's pivot wide the variables while keeping one row per day
+city_data2 <- city_data %>%
+  mutate(fahrenheit = celsius.to.fahrenheit(celsius),
+         measure = paste0(measure, "_F")) %>%
+  select(-celsius, -key) %>%
+  pivot_wider(names_from = 'measure', values_from = 'fahrenheit')
+
+rm(city_data)
+```
+
+### Analysis
+
+One way to check for long-term changes in the colder season is by looking at the frequency and intensity of freezing days (t-minimum <= 32F). Since winters in the north hemisphere are split by our arbitrary calendar year, we can aggregate this count by water year instead. Think of it as the fiscal year used in climate and water research.
+
+The analysis would end with water year 2025, which started in Oct. 1, 2024 and ran through Sept. 31, 2025.
+
+These are the specific metrics we quantified for each water year:
+
+- Number of freezing days
+- Date of the earliest and latest freezing day (to calculate the freezing season length)
+- Duration of longest streak of freezing days
+- Lowest daily minimum for the whole water year
+
+```{r c5}
+# calculate year/water year for aggregations
+# computations below get heavy so we can split by chunks
+city_data2_list <- city_data2 %>%
+  group_split(GEOID, .keep = TRUE)
+
+rm(city_data2)
+
+process_data2 <- function(df) {
+  df %>%
+    mutate(year = year(date),
+         month = month(date),
+         water_year = if_else(month >= 10, year + 1, year)) %>%
+    select(-month) %>%
+    mutate(water_year_start = as.Date(paste0(water_year - 1, "-10-01")),
+           doy_water = as.numeric(difftime(date, water_year_start, units = "days")) + 1) %>%
+    select(-water_year_start) %>%
+    # remove first water year (incomplete, we got that calendar year to fill the next)
+    filter(water_year >= 1956)
+}
+
+city_data3 <- map_dfr(city_data2_list, process_data2)
+
+rm(city_data2_list)
+
+# aggregate data by WATER year and calculate from MIN temp:
+# - number of freezing days (<= 32F),
+# - date for the first and last day each city reached freezing temp
+# - lowest daily minimum
+
+# split by GEOID again to process in batches
+city_data3_list <- city_data3 %>%
+  group_split(GEOID, .keep = TRUE)
+
+rm(city_data3)
+
+process_yearly_stats <- function(df) {
+  df %>%
+    mutate(freezing = ifelse(tmin_F <= 32, 1, 0)) %>%
+    group_by(place, GEOID, water_year) %>%
+    summarise(freezing_days = sum(freezing, na.rm = T),
+              freezing_first = min(doy_water[freezing == 1], na.rm = TRUE),
+              freezing_last = max(doy_water[freezing == 1], na.rm = TRUE),
+              coldest_min = min(tmin_F, na.rm = T)) %>%
+    # clean up these variables, replacing inf values for NA
+    mutate(freezing_first = replace(freezing_first, is.infinite(freezing_first), NA),
+           freezing_last = replace(freezing_last, is.infinite(freezing_last), NA),
+           # calculate season "length" (start to end of freezing days) if both dates exist
+           season_length = freezing_last - freezing_first)
+}
+
+yearly_stats <- map_dfr(city_data3_list, process_yearly_stats)
+
+## the aggregation above will produce many warnings for places that
+## don't get to below 32F but those are handled
+
+# separately, calculate the longest freezing days streak
+# by MIN temp per WATER year
+
+process_longest <- function(df) {
+  df %>%
+    arrange(place, year, date) %>% # ensure proper ordering
+    group_by(place, GEOID, water_year) %>%
+    mutate(freezing = ifelse(tmin_F <= 32, 1, 0),  # binary column
+           streak_id = cumsum(!freezing)) %>%  # assigns unique IDs to streaks
+    filter(freezing == 1) %>%  # keep only rows where avg temp <= 0
+    # record the longest for each city/water year
+    summarise(freezing_longest_streak = max(rle(streak_id)$lengths, na.rm = TRUE), .groups = "drop") 
+}
+
+longest <- map_dfr(city_data3_list, process_longest)
+
+# now join this back to yearly stats
+yearly_stats <- left_join(yearly_stats, longest)
+rm(longest, city_data3_list)
+
+```
+
+With a water-year aggregation by city, we can run individual metrics through linear regressions. While there are multiple stat tools to check the trend, this gives us a simple number, the slope, that describes: if the annual number of freezing days in a given place is increasing or decreasing (positive or negative value) and how quickly that change is happening.
+
+Multiplying the slope by the number of years (70) also gives us the total change over time. This is a better way to describe the change than comparing the first and last years as those can be biased with shorter-term variations of an unusually cold/hot year.
+
+In the last section we'll use a second stat tool to check if the trend is significant. For now, here's how we iterated the regressions. Note, to make this more robust, we only included cities that had at least one freezing day in at least half the years (n = 257).
+
+```{r c6}
+# we will only keep cities that had at least 1 freezing day 
+# in at least half the years analyzed
+complete <- yearly_stats %>%
+  mutate(freezing_water_year = ifelse(freezing_days >= 1, 1, 0)) %>%
+  group_by(place, GEOID) %>%
+  summarise(water_years_w_freezing = sum(freezing_water_year),
+            pct_water_years_freezing = water_years_w_freezing/n()) %>%
+  filter(pct_water_years_freezing >= 0.5)
+
+# filter for these
+yearly_stats_complete <- yearly_stats %>%
+  filter(GEOID %in% complete$GEOID)
+
+# now we'll split them in a list to apply some custom functions
+yearly_list <- split(yearly_stats_complete, yearly_stats_complete$GEOID)
+
+# to test change over time,
+# we will run linear regressions
+total_change_fc <- function(df) {
+  
+  start_year <- min(df$water_year)
+  end_year <- max(df$water_year)
+  
+  # set all the variables we'll test
+  vars <- c("freezing_days", "freezing_first", "freezing_last", 
+            "coldest_min", "season_length", "freezing_longest_streak")
+  
+  # initialize an empty list to store results
+  results <- list()
+  
+  # loop over variables and fit the linear model
+  for (var in vars) {
+    
+    # if a city has not experienced any freezing days then 
+    # freezing_days will be zero across all rows, and all the other vars will be NA
+    # when this happens, don't run any regressions and return NA results instead
+    if (sum(!is.na(df[[var]])) == 0 | sum(df$freezing_days == 0) == nrow(df)) {
+      
+      warning(paste("All values are NA or zero for", var, "in city:", unique(df$city)))
+      results[[var]] <- NA
+      
+    } else {
+      
+      ## if there's enough valid data, run this:
+      
+      # regression
+      model <- lm(as.formula(paste(var, "~ water_year")), data = df)
+      
+      # extract slope (change per water_year) and intercept
+      slope <- coef(model)["water_year"]
+      intercept <- coef(model)["(Intercept)"]
+    
+      # fitted/modeled values at the endpoints 
+      # f(x) = mx + b
+      start_fit <- (slope * start_year) + intercept
+      end_fit   <- (slope * end_year) + intercept
+      
+      # calculate total change over the period
+      total_change <- slope * (end_year - start_year)
+      
+      # store results
+      results[[paste0(var, "_change")]] <- total_change
+      results[[paste0(var, "_", start_year)]] <- start_fit
+      results[[paste0(var, "_", end_year)]] <- end_fit
+
+    }
+  }
+  
+  # convert the list into a dataframe and add GEOID/place name
+  results_df <- as.data.frame(results) %>%
+    mutate(GEOID = unique(df$GEOID),
+           place = unique(df$place)) %>%
+    select(GEOID, place, everything()) %>%
+    # round all numeric results to whole numbers (days),
+    # except coldest_min columns which keeps one decimal
+    mutate(across(where(is.numeric) & !contains("coldest_min"), round),
+           across(contains("coldest_min") & where(is.numeric), ~ round(.x, 1)))
+
+  return(results_df)
+  
+}
+
+# iterate through data
+# this represents the total change across the study period (1956-2025)
+# also included are the modeled values for the start and end years for each metric
+total_change <- lapply(yearly_list, total_change_fc) %>% bind_rows()
+rownames(total_change) <- NULL
+
+# export results both by year and aggregated
+write_csv(yearly_stats, "outputs/yearly_stats_city.csv")
+write_csv(total_change, "outputs/total_change_city.csv")
+```
+
+### Results
+
+This analysis shows 99% of major cities included (255/257) experienced an decrease in the number of freezing days since 1956. From those:
+
+- On average are now experiencing 19 fewer freezing days per water year.
+- Freezing days on average are starting 11 days later and ending 26 days earlier for a shorter cold season. 
+- The longest streak of freezing days in a water year is also 12 days shorter on average.
+- The coldest day of the water year has also warmed an average of 5.7 degrees Fahrenheit.
+
+When we ran the analysis to 1975-2024 the results aligned with earlier reports from [Climate Central](https://www.climatecentral.org/climate-matters/fewer-freezing-nights-2025) looking at a similar time period.
+
+A city-level summary table of the total change over time can be found below.
+
+Here's an example interpretation of the variables: if Fort Collins, Colorado says -10 for **freezing_days_change**, that means it now experiences 10 fewer freezing days than in the mid 1950s. A value of -67 for **season_length_change** means period of time between the first and last freezing day of the water year has gotten 67 days shorter (a combination of freezing starting later and ending sooner). The value under **cold_min_change** refers to how many degrees F is the coldest day in a water year warmed or cooled compared to the mid 1950s. Lastly, a value of -17 for **freezing_longest_streak_change** means the longest consecutive run of freezing days in a water year is now 17 days shorter than in the mid 1950s.
+
+```{r c7}
+# at city level: 99% (255 out of 257 major cities)
+nrow(filter(total_change, freezing_days_change < 0))/nrow(total_change)
+
+# from those:
+# - avg decrease was 19 days/water year
+# - a quarter had a decrease of 26/year
+# - freezing days are starting an average of 11 days later
+# and ending 26 days earlier for a season 37 days shorter
+# - the coldest min warmed by an average of 5.7F 
+# - even the longest streak in a season has decreased by an average of 12 days
+summary(filter(total_change, freezing_days_change < 0))
+
+# at city level: 86% lost at least 7 freezing days
+# (220 out of 257 major cities)
+nrow(filter(total_change, freezing_days_change <= -7))/nrow(total_change)
+
+# at city level: 67% lost at least 14 freezing days
+# (173 out of 257 major cities)
+nrow(filter(total_change, freezing_days_change <= -14))/nrow(total_change)
+
+# we can also check how these rankings by climate regions
+states_info <- fips_codes %>%
+  select(state_fip = state_code, state_abb = state, state_name) %>%
+  distinct() %>%
+  # data is only for CONUS, remove Puerto Rico and territories
+  filter(!state_abb %in% c("AK", "HI", "AS", "GU", "MP", "PR", "UM", "VI")) %>%
+  # from noaa: https://www.ncei.noaa.gov/access/monitoring/reference-maps/us-climate-regions
+  mutate(climate_division = case_when(
+    state_name %in% c("Connecticut","Delaware","Maine","Maryland",
+                      "Massachusetts","New Hampshire","New Jersey",
+                      "New York","Pennsylvania","Rhode Island","Vermont") ~ "Northeast",
+    state_name %in% c("Iowa","Michigan","Minnesota","Wisconsin") ~ "Upper Midwest",
+    state_name %in% c("Illinois","Indiana","Kentucky","Missouri",
+                      "Ohio","Tennessee","West Virginia") ~ "Ohio Valley",
+    state_name %in% c("Alabama","Florida","Georgia","North Carolina",
+                      "South Carolina","Virginia") ~ "Southeast",
+    state_name %in% c("Montana","Nebraska","North Dakota","South Dakota",
+                      "Wyoming") ~ "Northern Rockies and Plains",
+    state_name %in% c("Arkansas","Kansas","Louisiana","Mississippi",
+                      "Oklahoma","Texas") ~ "South",
+    state_name %in% c("Arizona","Colorado","New Mexico","Utah") ~ "Southwest",
+    state_name %in% c("Idaho","Oregon","Washington") ~ "Northwest",
+    state_name %in% c("California","Nevada") ~ "West"))
+
+# join this to our findings
+total_change <- total_change %>%
+  mutate(state_fip = substr(GEOID, 1, 2)) %>%
+  left_join(select(states_info, state_fip, climate_division), by = "state_fip") %>%
+  select(-state_fip)
+
+# let's look further into the which places increased
+total_change_decrease <- total_change %>%
+  filter(freezing_days_change < 0) %>%
+  arrange(freezing_days_change)
+
+# 9 of the top 10 decreases are in the upper midwest, ohio valley and the northeast
+# head(total_change_decrease, 10)
+```
+
+```{r e1, echo = FALSE}
+# display this in a table
+total_change %>%
+  select(city = place, freezing_days_change, coldest_min_change, season_length_change, 
+         freezing_longest_streak_change, climate_division) %>%
+  arrange(freezing_days_change) %>%
+  datatable(extensions = 'Buttons', options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf')))
+```
+
+While the summary stats above describe the overall change through the 70 years, we can also calculate the average number of freezing days (and the average for all the other metrics) by water year across the cities that saw a decrease in freezing days for more visualizations.
+
+Note, not all cities had freezing days every year. If a city didn't have freezing days, a value of 0 is used for the water year average calculation, but because freezing_first and freezing_last are NA, those are removed. Because our analysis already filtered to use those that had at least 1 freezing day in at least half the years, the removals shouldn't have a big impact. A column for how many had freezing days per year is included (mean is 244 cities and median 248, so close to the full set of 255).
+
+```{r city_average}
+# open them here if not loaded
+# yearly_stats <- read_csv("outputs/yearly_stats_city.csv")
+# total_change <- read_csv("outputs/total_change_city.csv")
+
+# filter cities that saw a decrease
+total_change_decrease <- total_change %>%
+  filter(freezing_days_change < 0)
+
+# now average these by year
+yearly_stats_avg <- yearly_stats %>%
+  filter(GEOID %in% total_change_decrease$GEOID) %>%
+  group_by(water_year) %>%
+  summarise(n_cities_freeze = sum(replace_na(freezing_days, 0) > 0),
+            mean_freezing_days = round(mean(freezing_days, na.rm = T)),
+            mean_freezing_first = round(mean(freezing_first, na.rm = T)),
+            mean_freezing_last = round(mean(freezing_last, na.rm = T)),
+            mean_coldest_min_F = round(mean(coldest_min, na.rm = T)))
+
+# check coverage by year, out of 255
+# summary(yearly_stats_avg$n_cities_freeze)
+```
+
+```{r fever, echo = FALSE, fig.height=4, fig.width=6, fig.align = 'center'}
+# line chart
+breaks_decade <- c(seq(1956, 2016, by = 10), 2025)
+
+yearly_stats_avg %>%
+  ggplot(aes(x = water_year, y = mean_freezing_days)) +
+  geom_line() +
+  ylim(40, 90) +
+  scale_x_continuous(breaks = breaks_decade, labels = breaks_decade) +
+  labs(title = "Average number of freezing days by water year",
+       subtitle = "Based on observed values from the 255 cities that saw an overall decrease",
+       x = NULL, y = NULL) +
+  theme_linedraw() +
+  theme(axis.title = element_blank())
+```
+
+For another visualization that compares the start and end of our study period, we also used the average across the cities that saw a decrease in freezing days but this time using values from the regression lines to account for the shorter term variability mentioned earlier since we are only displaying two years.
+
+```{r lollipop, echo = FALSE, fig.height=1.5, fig.width=6, fig.align = 'center'}
+# for another version of the viz, let's get the average 
+# start/end freezing dates from the regression values
+lollipop_df <- data.frame(water_year = c(1956, 2025),
+                          mean_freezing_first = c(mean(total_change_decrease$freezing_first_1956), 
+                                                  mean(total_change_decrease$freezing_first_2025)),
+                          mean_freezing_last = c(mean(total_change_decrease$freezing_last_1956), 
+                                                 mean(total_change_decrease$freezing_last_2025))) %>%
+  mutate(# reverse so oldest (1956) is on top
+        water_year_f = factor(water_year, levels = rev(sort(unique(water_year)))),
+        # water-year start date (Oct 1 of prior calendar year)
+        wy_start = as.Date(paste0(water_year - 1, "-10-01")),
+        # convert day-of-water-year to real dates
+        start_date = wy_start + (mean_freezing_first - 1),
+        end_date = wy_start + (mean_freezing_last - 1),
+        # format to M/D
+        start_lab = format(start_date, "%m/%d"),
+        start_lab = gsub("^0", "", start_lab),  # drop leading 0 in month
+        start_lab = gsub("/0", "/", start_lab), # drop leading 0 in day
+        end_lab = format(end_date, "%m/%d"),
+        end_lab = gsub("^0", "", end_lab),
+        end_lab = gsub("/0", "/", end_lab))
+
+# water year month ticks: Oct 1 = 1, Nov 1 = 32, ...
+month_breaks <- c(1, 32, 62, 93, 124, 152, 183, 213)
+month_labels <- c("Oct","Nov","Dec","Jan","Feb","Mar","Apr","May")
+
+# offset (in water-year days) to place labels slightly away from the points
+label_pad <- 3
+
+ggplot(lollipop_df, aes(y = water_year_f)) +
+  # segment (the "lollipop stick")
+  geom_segment(aes(x = mean_freezing_first,
+                   xend = mean_freezing_last,
+                   yend = water_year_f),
+               linewidth = 1, color = "grey55") +
+  # endpoints
+  geom_point(aes(x = mean_freezing_first, color = "Start"), size = 2) +
+  geom_point(aes(x = mean_freezing_last,  color = "End"),   size = 2) +
+  # left label for start (to the left of the start tip)
+  geom_text(aes(x = mean_freezing_first - label_pad, label = start_lab),
+            hjust = 1, vjust = 0.5, size = 3, color = "grey20") +
+  # right label for end (to the right of the end tip)
+  geom_text(aes(x = mean_freezing_last + label_pad, label = end_lab),
+            hjust = 0, vjust = 0.5, size = 3, color = "grey20") +
+  scale_x_continuous(limits = c(1, 213),
+                     breaks = month_breaks,
+                     labels = month_labels,
+                     expand = c(0.01, 0.01)) +
+  labs(title = "Average start and end of freezing days by water year",
+       subtitle = "Using linear regression values",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none",
+        panel.grid.minor = element_blank(),
+        panel.grid.major.y = element_blank(),
+        axis.title = element_blank())
+
+```
+
+### Validation
+
+To check our results in a different way, we can use a paired t-test. If we calculate the average annual freezing days over the two most recent decades (2006-2025) at a given location, we can pair this data point with the average for the first two decades (1956-1975) in the same place. Then, we can run this test across all cities with complete data, including those that are getting colder. We repeated this for the winter metrics we are tracking: number of freezing days, season length, longest freezing day streak, coldest temp of the year.
+
+Since the p-values for all tests are well below 0.01, it means we can reject the null hypothesis (no change over time), to say winters in these cities are generally getting shorter and milder.
+
+```{r c8}
+# split annual data into the first 2 decades vs the past 2 decades
+# aggregate our stats by the city/period to get "paired" numbers
+period <- yearly_stats_complete %>%
+  mutate(period = case_when(
+    water_year %in% c(1956:1975) ~ "first_half",
+    water_year %in% c(2006:2025) ~ "second_half")) %>%
+  group_by(place, period) %>%
+  summarise(avg_freezing_days = mean(freezing_days, na.rm = TRUE),
+            avg_season_length = mean(season_length, na.rm = TRUE),
+            avg_coldest_min = mean(coldest_min, na.rm = T),
+            avg_freezing_longest_streak = mean(freezing_longest_streak, na.rm = TRUE)) %>%
+  drop_na(period)
+  
+period_wide <- period %>%
+  pivot_wider(names_from = period,
+              values_from = c(avg_freezing_days, avg_season_length, avg_coldest_min, avg_freezing_longest_streak)) %>%
+  arrange(place)  # explicit, so x and y match
+
+## we can test for statistically significant changes using a t-test
+
+# since p < 0.01, this result is statistically significant at the 1% significance level 
+# we can reject the null hypothesis and conclude that there's been an decrease in
+# freezing days across major US cities
+t.test(period_wide$avg_freezing_days_second_half, 
+       period_wide$avg_freezing_days_first_half, 
+       paired = TRUE,
+       alternative = "less") # less days now
+
+# same for avg_season_length
+t.test(period_wide$avg_season_length_second_half, 
+       period_wide$avg_season_length_first_half, 
+       paired = TRUE, 
+       alternative = "less") # shorter season now
+
+# and for avg_coldest_min
+t.test(period_wide$avg_coldest_min_second_half, 
+       period_wide$avg_coldest_min_first_half, 
+       paired = TRUE, 
+       alternative = "greater") # higher temp now
+
+# and for avg_freezing_longest_streak
+t.test(period_wide$avg_freezing_longest_streak_second_half, 
+       period_wide$avg_freezing_longest_streak_first_half, 
+       paired = TRUE, 
+       alternative = "less") # shorter freezing streak now
+```
+
+## County-level data
+
+For further exploration of the data (like mapping), we can also use the gridded files to extract data at a county level using the same approach as before. To spare you from the repeat code, here are the two differences:
+
+- Use county geometry centroids (filtered by lower 48 states). There were only 13 counties where this approached failed to get data. These are places where the centroid fell on a lake or river. For these, we used the centroid of the biggest city/town within that county to ensure the centroids fell on land and data could be extracted.
+- Rather than only keeping cities with at least 1 freezing day in at least half the years, we ran it to all counties to keep the data spatially "complete."
+
+```{r c9, echo = FALSE}
+# get a list of all counties
+options(tigris_use_cache = TRUE)
+us_counties <- get_acs(geography = "county",
+                    variables = "B01003_001", # total population
+                    year = 2022,
+                    survey = "acs5",
+                    output = "wide",
+                    geometry = TRUE) %>%
+  select(NAME, GEOID, geometry)
+
+# get state FIPS to remove Hawaii, Alaska, Puerto Rico
+# we will also remove some independent cities in Virginia that show up with counties
+states_info <- fips_codes %>%
+  select(state_fip = state_code, state_abb = state, state_name) %>%
+  distinct()
+
+us_counties <- us_counties %>%
+  mutate(state_fip = substr(GEOID, 1, 2)) %>%
+  left_join(states_info, by = "state_fip") %>%
+  # remove AK and HI
+  filter(!state_abb %in% c("AK", "HI")) %>%
+  # and remove PR plus any territories
+  filter(!state_abb %in% c("AS", "GU", "MP", "PR", "UM", "VI")) %>%
+  # finally remove some cities in VA
+  filter(!str_detect(NAME, "\\bcity\\b")) %>% # keeps places like "James City County" but not "Harrisonburg city"
+  select(-state_fip, -state_abb, -state_name)
+
+# get the centroids 
+us_counties_cent <- us_counties %>%
+  mutate(center = st_centroid(geometry)) %>%
+  st_drop_geometry() %>% # removes city outline but keeps centroids
+  st_as_sf() %>%
+  st_transform(crs = st_crs(data_list[[1]])) # reproject to match our climate data
+
+# because there are 13 counties that have centroids that fall
+# on or near a body of water, those fail to extract climate data
+# we will overwrite their centroids to the center of their
+# most populated city/town
+missing_GEOID <- c("25001", "51131", "26083", "53055", "49011", "44005", 
+             "53029", "38055", "12087", "21143", "27007", "37143", "50013")
+
+missing_states <- c("FL", "KY", "MA", "MI", "MN", "NC", "ND", "RI", "UT", "VT",
+                    "VA", "WA")
+
+us_counties_miss <- us_counties %>% filter(GEOID %in% missing_GEOID)
+
+missing_places <- get_acs(
+  geography = "place",
+  variables = "B01003_001", # total population
+  year = 2022,
+  survey = "acs5",
+  output = "wide",
+  geometry = TRUE) %>%
+  select(NAME_place = NAME, GEOID_place = GEOID, pop = B01003_001E, 
+         geometry_place = geometry) %>%
+  mutate(state_fip = substr(GEOID_place, 1, 2)) %>%
+  left_join(states_info, by = "state_fip") %>%
+  # only keep from states that have missing counties
+  filter(state_abb %in% missing_states) %>%
+  select(-state_fip, -state_abb, -state_name)
+
+# spatial join: assign each place to a county
+# now we can narrow to the county as well
+places_within_county <- st_join(missing_places, us_counties_miss, 
+                                join = st_within) %>% drop_na(GEOID)
+
+# get the centroid for the largest place per county
+us_counties_miss_cent <- places_within_county %>%
+  group_by(NAME, GEOID) %>%
+  slice_max(pop, n = 1) %>%
+  ungroup() %>%
+  select(NAME, GEOID, geometry = geometry_place) %>%
+  mutate(center = st_centroid(geometry)) %>%
+  st_drop_geometry() %>% # removes county outline but keeps centroids
+  st_as_sf() %>%
+  st_transform(crs = st_crs(data_list[[1]])) # reproject to match our climate data
+
+# now replace those from the largest dataset
+us_counties_cent <- us_counties_cent %>%
+  filter(!GEOID %in% missing_GEOID) %>%
+  rbind(us_counties_miss_cent)
+
+rm(missing_states, missing_places, places_within_county, us_counties_miss, us_counties_miss_cent)
+  
+# check projection
+# st_crs(us_counties) # NAD83
+```
+
+```{r c10, eval = needs_county, echo = FALSE}
+# now we can get back to making a sample layer from temp data
+# and making a key from the x and y coords
+sample_layer_county <- data_list[[1]][[1]] %>% # first monthly file, first day
+  as.data.frame(xy = TRUE) %>%
+  mutate(key = paste0(round(x, 5), "_", round(y, 5))) %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(data_list[[1]])) %>%
+  select(-contains("tmax_"))
+
+# if we join this to our city list,
+# we'll have a key that connects each city to its nearest pixel in the climate data
+key_df_county <- us_counties_cent %>%
+  st_join(sample_layer_county, join = st_nearest_feature) %>%
+  select(NAME, GEOID, key) %>%
+  st_drop_geometry()
+
+# check how many keys were created
+# length(unique(key_df_county$key)) # 3069 keys for 3069 counties
+
+rm(sample_layer_county)
+
+## now we can extract the data from the gridded file
+
+# convert city centers to a terra SpatVector object
+county_points <- vect(us_counties_cent)
+
+# reuse the extract function
+county_data <- map_dfr(.x = data_list,
+                       .f = extract_fc,
+                       place_points = county_points,
+                       key_df = key_df_county)
+
+rm(county_points, data_list, us_counties_cent)
+
+# save this as an R object to save processing time
+saveRDS(county_data, county_data_path)
+```
+
+```{r c11, echo = FALSE}
+
+# if this is a quick run, read the input file
+# if it's a full run, the will was created in the last chunk, so carry on
+if (needs_county == F) {
+  county_data <- readRDS(county_data_path)
+} else {
+  message("Using input files from previous computation")
+}
+
+# convert celsius to F
+# then let's pivot wide the variables while keeping one row per day
+county_data2 <- county_data %>%
+  mutate(fahrenheit = celsius.to.fahrenheit(celsius),
+         measure = paste0(measure, "_F")) %>%
+  select(-celsius, -key) %>%
+  pivot_wider(names_from = 'measure', values_from = 'fahrenheit')
+
+rm(county_data)
+
+# calculate year/water year for aggregations
+# computations below get heavy so we can split by chunks
+county_data2_list <- county_data2 %>%
+  group_split(GEOID, .keep = TRUE)
+
+rm(county_data2)
+
+county_data3 <- map_dfr(county_data2_list, process_data2)
+
+rm(county_data2_list)
+
+# aggregate data by WATER year and calculate from MIN temp:
+# - number of freezing days (<= 32F),
+# - date for the first and last day each city reached freezing temp
+# - lowest daily minimum
+
+# split by GEOID again to process in batches
+county_data3_list <- county_data3 %>%
+  group_split(GEOID, .keep = TRUE)
+
+rm(county_data3)
+
+yearly_stats_county <- map_dfr(county_data3_list, process_yearly_stats)
+
+## the aggregation above will produce many warnings for places that
+## don't get to below 32F but those are handled
+
+# separately, calculate the longest freezing days streak
+# by MIN temp per WATER year
+longest_county <- map_dfr(county_data3_list, process_longest)
+
+# now join this back to yearly stats
+yearly_stats_county <- left_join(yearly_stats_county, longest_county)
+rm(longest_county, county_data3_list)
+
+# now we'll split them in a list to apply some custom functions
+yearly_list_county <- split(yearly_stats_county, yearly_stats_county$GEOID)
+
+# reuse total_change_fc to iterate on county data
+# this represents the total change across the study period (1956-2025)
+total_change_county <- lapply(yearly_list_county, total_change_fc) %>% bind_rows()
+rownames(total_change_county) <- NULL
+
+rm(yearly_list_county)
+
+# export results both by year and aggregated
+write_csv(yearly_stats_county, "outputs/yearly_stats_county.csv")
+write_csv(total_change_county, "outputs/total_change_county.csv")
+```
+
+After processing the data, we can join the results back to the geometries to map it. Here is the total change in freezing days between 1956-2025:
+
+```{r c12, echo = FALSE, fig.align = 'center'}
+# join geometries back
+total_change_county_geom <- total_change_county %>%
+  left_join(us_counties, by = "GEOID") %>%
+  rename(county_name = NAME)
+
+# set map to interactive, for static do: tmap_mode("plot")
+tmap_mode("view")
+
+# set bins. right-closed: (a, b] includes b, but NOT a
+# that also means that to lump counties with 0, we need to set a value right under
+brks <- c(-Inf, -28, -21, -14, -7, -1e-9, Inf)
+labs <- c("4 or more weeks lost",
+          "3-4 weeks lost",
+          "2-3 weeks lost",
+          "1-2 weeks lost",
+          "Under 1 week lost",
+          "Freezing days gained or no change")
+
+
+# brown color palette
+pal <- c("#4A2C1A","#6A3B22","#8A4A2B","#B1704B","#D9B08C","#effeff")
+
+# a few more options
+# pal <- c("#00441B","#1A5E2E","#2F7F45","#5AAE61","#A6DDA0","#FFF6E0")
+# pal <- c("#7F0000","#B30000","#D7301F","#EF6548","#FCAE91","#F1F7FF")
+# pal <- c("#54278f","#6A51A3","#756bb1","#9e9ac8","#cbc9e2","#FFF6E0")
+
+total_change_county_geom %>%
+  select(place, freezing_days_change, geometry) %>%
+  st_as_sf() %>%
+  tm_shape() +
+  tm_polygons(col = "freezing_days_change",
+              style = "fixed",
+              breaks = brks,
+              labels = labs,
+              palette = pal,
+              title = "Change in freezing days",
+              border.col = "black",
+              lwd = 0.1,
+              textNA = "NA") +
+  tm_layout(legend.outside = TRUE, frame = FALSE,
+    main.title = "Change in freezing days per season, compared to the mid 1950s")
+
+# let's also export data as a geojson file
+# we will only keep essential columns and we will smooth geometries
+# so that the file is not massive
+# total_change_county_geom %>%
+#   select(GEOID, county_name, freezing_days_change = freezing_days_change, geometry) %>%
+#   st_as_sf() %>%
+#   ms_simplify(keep = 0.25, keep_shapes = TRUE) %>% # adjust as needed
+#   st_make_valid() %>%
+#   st_write("outputs/mapping/total_change_county_v2.geojson",
+#          delete_dsn = TRUE)
+```

@@ -1,0 +1,14 @@
+.Rhistory
+.Rapp.history
+.Ruserdata
+.DS_Store
+.Rproj.user
+inputs/*
+outputs/city_data.RDS
+outputs/county_data.RDS
+outputs/mapping/*
+outputs/graphics/*
+outputs/total_change_county_state_agg.csv
+outputs/yearly_stats_city_avg.csv
+lakes_and_powell_viz.R
+state_boundaries.R
