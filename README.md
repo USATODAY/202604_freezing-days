@@ -15,7 +15,7 @@ In short, the freezing season is becoming shorter and milder.
 
 This is based on an analysis of climate data spanning 1956-2025. We extracted daily minimum temperature from the center of every city with a population over 100,000. We then ran linear regressions on those that had at least one freezing day in at least half the years.
 
-For more details on our methods, you can run the `methods.Rmd` file or go through the notebook here: https://usatoday.github.io/202511_freezing-days/methods.html
+For more details on our methods, you can run the `methods.Rmd` file or go through the notebook here: https://usatoday.github.io/202604_freezing-days/methods.html
 
 ## Outputs
 
