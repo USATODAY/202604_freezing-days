@@ -1,7 +1,7 @@
 ---
 title: "Freezing days analysis"
 author: "Ignacio Calderon, USA TODAY"
-date: "`r Sys.Date()`"
+date: "2026-04-22"
 output:
   html_document:
     theme: united
@@ -435,7 +435,10 @@ total_change_fc <- function(df) {
     if (sum(!is.na(df[[var]])) == 0 | sum(df$freezing_days == 0) == nrow(df)) {
       
       warning(paste("All values are NA or zero for", var, "in city:", unique(df$city)))
-      results[[var]] <- NA
+      
+      results[[paste0(var, "_change")]] <- NA
+      results[[paste0(var, "_", start_year)]] <- NA
+      results[[paste0(var, "_", end_year)]] <- NA
       
     } else {
       
